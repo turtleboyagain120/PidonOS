@@ -1,0 +1,212 @@
+# Dependency Recon workflow (template)
+# Purpose: perform repository-language detection, find package manifests,
+# run per-ecosystem dependency listing + quick audit commands, and collect reports.
+# Location: .github/workspace/dependency-recon-action.yml
+# Notes:
+# - Designed to be safe to run with only GITHUB_TOKEN (no other secrets).
+# - Produces artifacts (dependency-lists, audit outputs) for later inspection.
+# - Uses concrete repo: turtleboyagain120/PidonOS (from GitHub metadata).
+#
+# Trigger:
+# - Manually via workflow_dispatch for on-demand research.
+# - On pushes to main to keep research results up-to-date.
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [ "main" ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+name: "PidonOS Dependency Recon (repo: turtleboyagain120/PidonOS)"
+
+permissions:
+  contents: read    # to fetch repository files
+  id-token: write   # allow actions that may use OIDC (not required)
+  actions: read
+
+jobs:
+  detect-and-list:
+    name: Detect languages and list dependency manifests
+    runs-on: ubuntu-latest
+    outputs:
+      found-manifests: ${{ steps.find_manifest.outputs.manifests || '' }}
+    steps:
+      - name: Checkout repository (full)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Report repository facts (from metadata)
+        run: |
+          echo "Repository: turtleboyagain120/PidonOS"
+          echo "Default branch: main"
+          echo "License: Apache-2.0"
+          echo "Homepage: https://guns.lol/turtleboyagain"
+          echo "Runner: $(uname -a)"
+      - name: Query GitHub languages API (concrete)
+        env:
+          GITHUB_REPO: turtleboyagain120/PidonOS
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Querying GitHub languages for $GITHUB_REPO"
+          curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/${GITHUB_REPO}/languages" \
+            | jq -r 'to_entries | map("\(.key): \(.value)") | .[]' > languages.txt || true
+          echo "--- languages ---"
+          cat languages.txt || true
+          # Upload as artifact for later review
+          gh --version || true
+      - name: Find common dependency manifests (package.json, requirements.txt, go.mod, Pipfile, mix.exs, Gemfile, Cargo.toml)
+        id: find_manifest
+        run: |
+          set -e
+          # Look for common manifest filenames across the repo
+          manifests=$(git ls-files | egrep -i '(^|/)package\.json$|(^|/)requirements\.txt$|(^|/)go\.mod$|(^|/)Pipfile$|(^|/)Gemfile$|(^|/)mix\.exs$|(^|/)Cargo\.toml$' || true)
+          printf "%s" "$manifests" > found_manifests.txt
+          echo "Found manifests:"
+          cat found_manifests.txt || true
+          # Expose as outputs (newline separated)
+          manifests_output=$(awk '{printf "%s\\n", $0}' found_manifests.txt)
+          echo "::set-output name=manifests::$manifests_output"
+      - name: Upload manifests list artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: found-manifests
+          path: found_manifests.txt
+
+  per-ecosystem-research:
+    name: Per-ecosystem dependency research and audits
+    runs-on: ubuntu-latest
+    needs: detect-and-list
+    strategy:
+      matrix:
+        # We'll run a set of checks that are no-ops if the manifest doesn't exist.
+        ecosystem: [node, python, go, rust, ruby, elixir]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show which ecosystem this job handles
+        run: echo "Ecosystem = ${{ matrix.ecosystem }}"
+
+      - name: Node/NPM: list deps & run npm audit if package.json exists
+        if: matrix.ecosystem == 'node'
+        run: |
+          if [ -f package.json ] || git ls-files | grep -q 'package.json'; then
+            echo "Detected package.json; listing dependencies (npm ls --all)"
+            # Install minimal so npm ls works without performing full install of native modules.
+            npm ci --ignore-scripts --no-audit --no-fund || true
+            npm ls --all --json > node-deps-tree.json || true
+            echo "Running npm audit (may need network access)"
+            npm audit --json > npm-audit.json || true
+            du -h node-deps-tree.json npm-audit.json || true
+            ls -la
+          else
+            echo "No package.json found; skipping node steps"
+          fi
+          # Upload artifacts conditionally via the actions/upload-artifact step below.
+
+      - name: Python: inspect requirements and pip-audit
+        if: matrix.ecosystem == 'python'
+        run: |
+          if git ls-files | grep -qi 'requirements.txt' || test -f requirements.txt ; then
+            echo "Detected Python requirements. Creating virtualenv and running pip-audit"
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip setuptools wheel
+            pip install pip-audit || true
+            pip-audit --format json > pip-audit.json || true
+            pip freeze > pip-freeze.txt || true
+          else
+            echo "No requirements.txt found; skipping python checks"
+          fi
+
+      - name: Go: list modules if go.mod exists
+        if: matrix.ecosystem == 'go'
+        env:
+          GOCACHE: ${{ runner.temp }}/gocache
+        run: |
+          if test -f go.mod || git ls-files | grep -q 'go.mod'; then
+            echo "Detected go.mod; listing modules"
+            GO111MODULE=on go list -m all > go-mod-list.txt || true
+          else
+            echo "No go.mod found; skipping go checks"
+          fi
+
+      - name: Rust: cargo metadata if Cargo.toml exists
+        if: matrix.ecosystem == 'rust'
+        run: |
+          if test -f Cargo.toml || git ls-files | grep -q 'Cargo.toml'; then
+            echo "Detected Cargo.toml; running cargo metadata (may take time)"
+            rustup --version || true
+            cargo metadata --format-version 1 > cargo-metadata.json || true
+          else
+            echo "No Cargo.toml found; skipping rust checks"
+          fi
+
+      - name: Ruby: bundle list if Gemfile detected
+        if: matrix.ecosystem == 'ruby'
+        run: |
+          if test -f Gemfile || git ls-files | grep -q 'Gemfile'; then
+            echo "Detected Gemfile; bundling may require native build support"
+            gem --version || true
+            bundle config set path 'vendor/bundle' || true
+            bundle lock --update --local || true
+            bundle list --paths > ruby-paths.txt || true
+          else
+            echo "No Gemfile; skipping ruby checks"
+          fi
+
+      - name: Elixir: mix deps if mix.exs detected
+        if: matrix.ecosystem == 'elixir'
+        run: |
+          if test -f mix.exs || git ls-files | grep -q 'mix.exs'; then
+            echo "Detected mix.exs; running mix deps.get (may not be available in runner)"
+            mix --version || true
+            mix deps.get || true
+            mix deps > elixir-deps.txt || true
+          else
+            echo "No mix.exs; skipping elixir checks"
+          fi
+
+      - name: Upload ecosystem artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifacts are a superset; some will be missing depending on which manifest existed.
+          name: "deps-artifacts-${{ matrix.ecosystem }}-${{ github.sha }}"
+          path: |
+            node-deps-tree.json
+            npm-audit.json
+            pip-audit.json
+            pip-freeze.txt
+            go-mod-list.txt
+            cargo-metadata.json
+            ruby-paths.txt
+            elixir-deps.txt
+        continue-on-error: true
+
+  aggregate-report:
+    name: Aggregate results and produce a short research summary
+    runs-on: ubuntu-latest
+    needs: [ detect-and-list, per-ecosystem-research ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Gather artifacts (no credentials needed)
+        run: |
+          echo "This step assumes artifacts from previous jobs are available in the Actions UI."
+          # Create a simple summary file with the repo facts we know
+          cat > dependency-recon-summary.txt <<'EOF'
+Repository: turtleboyagain120/PidonOS
+License: Apache-2.0
+Default branch: main
+Research summary: See per-ecosystem artifacts for details (node, python, go, rust, ruby, elixir)
+EOF
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-recon-summary
+          path: dependency-recon-summary.txt
+      - name: Output short summary to console
+        run: |
+          echo "Dependency recon completed. Check artifacts in the workflow run for detailed outputs."
