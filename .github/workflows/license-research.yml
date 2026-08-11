@@ -1,0 +1,158 @@
+# Dependency Graph & License Research workflow
+# Purpose: produce dependency graph extracts, run license scanning heuristics,
+# and raise issues (or create a file) documenting problematic licenses and unfamiliar dependencies.
+# Location: .github/workspace/dependency-graph-license-research.yml
+#
+# Behavior:
+# - Uses GitHub API to request dependency graph (if available) and falls back to local scanning.
+# - Uses licensee (or simple license header heuristics) to detect license files, then compares against an allowlist.
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+name: "PidonOS Dependency Graph + License Research (turtleboyagain120/PidonOS)"
+
+permissions:
+  contents: read
+  issues: write   # optionally open issues for licensing red flags
+  id-token: write
+
+env:
+  REPO: turtleboyagain120/PidonOS
+  ALLOWED_LICENSES: "Apache-2.0;MIT;BSD-3-Clause"
+
+jobs:
+  github-dep-graph:
+    name: Query GitHub dependency graph API
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask GitHub for the dependency graph snapshot (if enabled)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The dependency graph API may return 403 if the repo lacks dependency graph enabled.
+          echo "Requesting dependency graph for ${REPO}"
+          resp=$(curl -s -H "Authorization: token $TOKEN" "https://api.github.com/repos/${REPO}/dependency-graph/snapshot" || true)
+          echo "$resp" > gh-dep-graph.json || true
+          if [ -s gh-dep-graph.json ]; then
+            echo "Saved dependency graph snapshot to gh-dep-graph.json"
+            jq -r 'keys[]' gh-dep-graph.json || true
+          else
+            echo "No dependency-graph snapshot returned or not enabled for repository"
+          fi
+      - name: Upload dependency graph snapshot (if present)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-graph-snapshot
+          path: gh-dep-graph.json
+
+  local-license-scan:
+    name: Local license detection and filtering
+    runs-on: ubuntu-latest
+    needs: github-dep-graph
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Locate license files and run license heuristics
+        run: |
+          mkdir -p license-reports
+          echo "Allowed licenses: ${ALLOWED_LICENSES}"
+          # Find common license file names
+          find . -maxdepth 3 -type f \( -iname LICENSE -o -iname LICENSE.md -o -iname COPYING -o -iname LICENSE.txt \) -print > license-files.txt || true
+          echo "License files discovered:"
+          cat license-files.txt || true
+          # Extract license text and attempt to classify (simple heuristics)
+          i=0
+          while read -r f; do
+            i=$((i+1))
+            echo "---- license-$i ----" > license-reports/license-$i.txt
+            echo "File: $f" >> license-reports/license-$i.txt
+            sed -n '1,200p' "$f" >> license-reports/license-$i.txt || true
+            # Try to classify by matching common SPDX ids
+            if grep -qi "apache" "$f"; then echo "SPDX: Apache-2.0" >> license-reports/license-$i.txt; fi
+            if grep -qi "mit" "$f"; then echo "SPDX: MIT" >> license-reports/license-$i.txt; fi
+            if grep -qi "bsd" "$f"; then echo "SPDX: BSD" >> license-reports/license-$i.txt; fi
+          done < license-files.txt || true
+
+      - name: Search common package manifests for license fields
+        run: |
+          # Inspect package.json license field if present
+          if [ -f package.json ]; then
+            jq -r '.license // .licenses' package.json > license-packagejson.txt || true
+            echo "package.json license field:"
+            cat license-packagejson.txt || true
+            cp license-packagejson.txt license-reports/ || true
+          fi
+          # Check go.mod for license hints (not always present)
+          if [ -f go.mod ]; then
+            grep -i license go.mod || true
+          fi
+      - name: Produce license summary and flag mismatches
+        run: |
+          mkdir -p license-summary
+          echo "License summary for ${REPO}" > license-summary/summary.txt
+          echo "Allowed licenses: ${ALLOWED_LICENSES}" >> license-summary/summary.txt
+          # Simple heuristic: any detected SPDX tag not in allowed list will be flagged
+          for f in license-reports/*.txt package.json license-packagejson.txt; do
+            [ -e "$f" ] || continue
+            echo "---- $f ----" >> license-summary/summary.txt
+            grep -i 'SPDX' "$f" || true
+            # Extract e.g., 'Apache-2.0' or 'MIT'
+            tag=$(grep -Eo 'Apache-2.0|MIT|BSD-3-Clause' "$f" | head -n1 || true)
+            if [ -n "$tag" ]; then
+              echo "Detected license tag: $tag" >> license-summary/summary.txt
+              if ! echo "${ALLOWED_LICENSES}" | grep -q "$tag"; then
+                echo "FLAG: $tag is NOT in allowlist" >> license-summary/summary.txt
+                # Optionally create an issue for maintainers to review license
+                gh issue create --title "License flag: $tag detected in $f" --body "Automated scan detected license $tag in file $f. Please review." --repo turtleboyagain120/PidonOS || true
+              fi
+            else
+              echo "No SPDX tag detected in $f" >> license-summary/summary.txt
+            fi
+          done
+      - name: Upload license reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-reports
+          path: |
+            license-reports
+            license-summary/summary.txt
+            license-files.txt
+
+  risky-deps-and-issues:
+    name: Identify risky dependencies and optionally open issues
+    runs-on: ubuntu-latest
+    needs: local-license-scan
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Parse dependency artifacts (best-effort) and flag unusual packages
+        run: |
+          echo "Inspect previously uploaded artifacts in the workflow run for details."
+          # Basic pattern matching to flag dependencies with suspicious names (heuristic)
+          suspicious="[^a-zA-Z0-9_.-](untrusted|backdoor|malware|suspicious)"
+          if [ -f node-deps-tree.json ]; then
+            jq -r '..|objects|.name? // empty' node-deps-tree.json | sort -u > node-dep-names.txt || true
+            echo "Node dependency names:"
+            head -n 50 node-dep-names.txt || true
+            # Heuristic scan
+            grep -Ei "$suspicious" node-dep-names.txt || true
+          fi
+          # Similar heuristics could be added for other ecosystems if artifacts were created
+      - name: Create research findings file
+        run: |
+          cat > dependency-license-findings.txt <<'EOF'
+PidonOS dependency & license research findings (automated)
+Repository: turtleboyagain120/PidonOS
+Please inspect the uploaded artifacts in this workflow run for detailed outputs.
+EOF
+          ls -la
+      - name: Upload final findings
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-license-findings
+          path: dependency-license-findings.txt
