@@ -1,7 +1,5 @@
 # 📦 PidonOS v1.0 — Complete User Guide
 
-> **ELI5 = "Explain Like I'm 5"** — simple words, easy steps, lots of emojis!
-
 ---
 
 ## 📋 Table of Contents
